@@ -5,7 +5,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+import ttnn
 
+
+class LightweightModule:
+    """Torch modules add a surprising amount of host overhead for attribute
+    access and method calls. This class is a lightweight alternative that
+    just wraps a forward function for now."""
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -191,7 +200,7 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-
+    
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
