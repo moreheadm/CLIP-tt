@@ -10,7 +10,7 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 
-from .model import build_model
+from .model import build_model, init_ttnn
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 try:
@@ -116,6 +116,8 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     preprocess : Callable[[PIL.Image], torch.Tensor]
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
+    init_ttnn()
+
     if name in _MODELS:
         model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
     elif os.path.isfile(name):
@@ -135,11 +137,15 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
                 jit = False
             state_dict = torch.load(opened_file, map_location="cpu")
 
+    #print(state_dict or model.state_dict())
+    print(jit)
+
     if not jit:
         model = build_model(state_dict or model.state_dict()).to(device)
         if str(device) == "cpu":
             model.float()
         return model, _transform(model.visual.input_resolution)
+
 
     # patch the device names
     device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])

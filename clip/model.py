@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import ttnn
+import sys
 
 
 class LightweightModule:
@@ -16,7 +17,120 @@ class LightweightModule:
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
-class Bottleneck(nn.Module):
+    def _load_state_dict(self, state_dict, prefix=''):
+        for name, value in self.__dict__.items():
+            full_name = prefix + name
+
+            if isinstance(value, LightweightModule):
+               value._load_state_dict(state_dict, full_name + '.')
+            elif full_name in state_dict:
+                self.__dict__[name] = convert_to_ttnn(state_dict[full_name])
+            else:
+                print(f'Warning: {full_name} for {self.__class__.__name__} not found in state '
+                      f'dict', file=sys.stderr)
+
+device = None
+
+class TTCompatModule(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _load_from_state_dict(
+            self,
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+        for name, value in self.__dict__.items():
+            if isinstance(value, LightweightModule):
+                value._load_state_dict(state_dict, prefix + name + '.')
+
+
+def init_ttnn():
+    global device
+    device = ttnn.open_device(device_id=0)
+
+def deinit_ttnn():
+    global device
+    if device is not None:
+        ttnn.close_device(device)
+
+def convert_to_ttnn(x):
+    global device
+    if isinstance(x, torch.Tensor):
+        return ttnn.from_torch(x, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    else:
+        return x
+
+def convert_from_ttnn(x):
+    global device
+    if isinstance(x, ttnn._ttnn.tensor.Tensor):
+        return ttnn.to_torch(x)
+    else:
+        return x
+
+def convert_shape(shape):
+    if isinstance(shape, int):
+        return (shape,)
+    else:
+        return list(shape)
+
+
+def tt_torch_compat(cls):
+    """
+    Class decorator that wraps the forward method of a nn.Module to convert
+    all arguments from TTNN format before calling the original forward.
+    """
+
+    if issubclass(cls, nn.Module):
+        original_forward = cls.forward
+
+        def new_forward(self, *args, **kwargs):
+            # Convert all positional arguments
+            converted_args = tuple(convert_from_ttnn(arg) for arg in args)
+
+            # Convert all keyword arguments
+            converted_kwargs = {k: convert_from_ttnn(v) for k, v in kwargs.items()}
+
+            # Call the original forward with converted arguments
+            return original_forward(self, *converted_args, **converted_kwargs)
+
+        cls.forward = new_forward
+        return cls
+
+    elif issubclass(cls, LightweightModule):
+        original_forward = cls.forward
+
+        def new_forward(self, *args, **kwargs):
+            # Convert all positional arguments
+            converted_args = tuple(convert_to_ttnn(arg) for arg in args)
+
+            # Convert all keyword arguments
+            converted_kwargs = {k: convert_to_ttnn(v) for k, v in kwargs.items()}
+
+            return convert_from_ttnn(original_forward(self, *converted_args, **converted_kwargs))
+        cls.forward = new_forward
+        return cls
+    else:
+        return cls
+
+
+@tt_torch_compat
+class Bottleneck(TTCompatModule):
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1):
@@ -48,7 +162,8 @@ class Bottleneck(nn.Module):
                 ("1", nn.BatchNorm2d(planes * self.expansion))
             ]))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
+        x = convert_from_ttnn(x)
         identity = x
 
         out = self.relu1(self.bn1(self.conv1(x)))
@@ -63,8 +178,8 @@ class Bottleneck(nn.Module):
         out = self.relu3(out)
         return out
 
-
-class AttentionPool2d(nn.Module):
+@tt_torch_compat
+class AttentionPool2d(TTCompatModule):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
@@ -75,6 +190,7 @@ class AttentionPool2d(nn.Module):
         self.num_heads = num_heads
 
     def forward(self, x):
+        x = convert_from_ttnn(x)
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
@@ -100,7 +216,8 @@ class AttentionPool2d(nn.Module):
         return x.squeeze(0)
 
 
-class ModifiedResNet(nn.Module):
+@tt_torch_compat
+class ModifiedResNet(TTCompatModule):
     """
     A ResNet class that is similar to torchvision's but contains the following changes:
     - There are now 3 "stem" convolutions as opposed to 1, with an average pool instead of a max pool.
@@ -145,6 +262,8 @@ class ModifiedResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        x = convert_from_ttnn(x)
+
         def stem(x):
             x = self.relu1(self.bn1(self.conv1(x)))
             x = self.relu2(self.bn2(self.conv2(x)))
@@ -162,57 +281,118 @@ class ModifiedResNet(nn.Module):
 
         return x
 
+#class LayerNorm(TTCompatModule):
+#    """Subclass torch's LayerNorm to handle fp16."""
 
-class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16."""
+#    def forward(self, x):
+#        x = convert_to_ttnn(x)
 
-    def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
-        ret = super().forward(x.type(torch.float32))
-        return ret.type(orig_type)
+#        ret = ttnn.layer_norm(x, epsilon=1e-5)
+#        return convert_from_ttnn(ret)
+
+#class LayerNorm(nn.LayerNorm):
+#    """Subclass torch's LayerNorm to handle fp16."""
+#    def __init__(self, *args, **kwargs):
+#        super().__init__(*args, **kwargs)
+#        self.ttnn_weights = None
+#        self.ttnn_biases = None
+
+#    def forward(self, x: torch.Tensor):
+#        if self.ttnn_weights is None:
+#            self.ttnn_weights = convert_to_ttnn(self.weight)
+#            self.ttnn_biases = convert_to_ttnn(self.bias)
+
+#        ttnn.layer_norm(x, weight=self.ttnn_weights, bias=self.ttnn_biases, epsilon=1e-5)
+
+@tt_torch_compat
+class LayerNorm(LightweightModule):
+
+    def __init__(self, shape):
+        shape = convert_shape(shape)
+        self.weight = ttnn.zeros(shape, device=device)
+        self.bias = ttnn.zeros(shape, device=device)
+
+    def forward(self, x):
+        return ttnn.layer_norm(x, weight=self.weight, bias=self.bias, epsilon=1e-5)
 
 
-class QuickGELU(nn.Module):
-    def forward(self, x: torch.Tensor):
-        return x * torch.sigmoid(1.702 * x)
+#class QuickGELU(TTCompatModule):
+#    def forward(self, x: torch.Tensor):
+#        return x * torch.sigmoid(1.702 * x)
+
+@tt_torch_compat
+class QuickGELU(LightweightModule):
+    def forward(self, x):
+        return x * ttnn.sigmoid(1.702 * x)
+
+@tt_torch_compat
+class Linear(LightweightModule):
+    def __init__(self, in_features, out_features):
+        self.weight = ttnn.zeros((in_features, out_features))
+        self.bias = ttnn.zeros((out_features,))
+
+    def forward(self, x):
+        return ttnn.linear(x, self.weight, bias=self.bias, transpose_b=True)
+
+@tt_torch_compat
+class MultilayerPerceptron(LightweightModule):
+    def __init__(self, d_model: int):
+        self.c_fc = Linear(d_model, d_model * 4)
+        self.gelu = QuickGELU()
+        self.c_proj = Linear(d_model * 4, d_model)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
+class MultiheadAttention(LightweightModule):
+    def __init__(self, d_model: int, n_head: int, attn_mask):
+        pass
+
+    def forward(self, x):
+        return ttnn.scaled_dot_product_attention(x, x, x, is_causal=False)
 
 
-class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+
+
+@tt_torch_compat
+class ResidualAttentionBlock(TTCompatModule):
+    def __init__(self, d_model: int, n_head: int, attn_mask):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
+        self.mlp = MultilayerPerceptron(d_model)
         self.ln_2 = LayerNorm(d_model)
-        self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
+    def forward(self, x):
+        x = convert_to_ttnn(x)
+        x = x + self.attention(convert_from_ttnn(self.ln_1(x)))
         x = x + self.mlp(self.ln_2(x))
         return x
 
-    
-class Transformer(nn.Module):
+@tt_torch_compat
+class Transformer(TTCompatModule):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = [ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)]
 
-    def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+    def forward(self, x):
+        x = convert_from_ttnn(x)
+        for resblock in self.resblocks:
+            x = resblock(x)
+        return x
 
-
-class VisionTransformer(nn.Module):
+@tt_torch_compat
+class VisionTransformer(TTCompatModule):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
         self.input_resolution = input_resolution
@@ -229,7 +409,8 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
+        x = convert_from_ttnn(x)
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -249,7 +430,8 @@ class VisionTransformer(nn.Module):
         return x
 
 
-class CLIP(nn.Module):
+@tt_torch_compat
+class CLIP(TTCompatModule):
     def __init__(self,
                  embed_dim: int,
                  # vision
@@ -292,7 +474,7 @@ class CLIP(nn.Module):
             width=transformer_width,
             layers=transformer_layers,
             heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
+            attn_mask=convert_to_ttnn(self.build_attention_mask())
         )
 
         self.vocab_size = vocab_size
@@ -328,8 +510,8 @@ class CLIP(nn.Module):
         for block in self.transformer.resblocks:
             nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
             nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+            #nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            #nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
@@ -430,16 +612,36 @@ def build_model(state_dict: dict):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
 
+    print(f'''CLIP model with
+          embed_dim: {embed_dim}
+          image_resolution: {image_resolution}
+          vision_layers: {vision_layers}
+          vision_width: {vision_width}
+          vision_patch_size: {vision_patch_size}
+          context_length: {context_length}
+          vocab_size: {vocab_size}
+          transformer_width: {transformer_width}
+          transformer_heads: {transformer_heads}
+          transformer_layers: {transformer_layers}
+          ''')
+
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
     )
+    print(model)
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
 
     convert_weights(model)
-    model.load_state_dict(state_dict)
+    print('Loading state dict:')
+    for key, value in state_dict.items():
+        print(key, value.shape)
+
+    model.load_state_dict(state_dict, strict=False)
+    #print('Post layer norm weight: ',  model.visual.ln_post.weight)
+    #print('Post layer norm bias: ',  model.visual.ln_post.bias)
     return model.eval()
