@@ -321,9 +321,6 @@ class TTLayerNorm(LightweightModule):
         self.bias = ttnn.zeros(shape, dtype=ttnn.float32, device=device)
 
     def forward(self, x):
-        print(x)
-        print(self.weight)
-        print(self.bias)
         return ttnn.layer_norm(x, weight=self.weight, bias=self.bias, epsilon=1e-5)
 
 
@@ -358,14 +355,15 @@ class MultilayerPerceptron(LightweightModule):
         x = self.c_proj(x)
         return x
 
+@tt_torch_compat
 class MultiheadAttention(LightweightModule):
     def __init__(self, d_model: int, n_head: int, attn_mask):
-        pass
+        w_qs = Linear(d_model, n_head * d_model)
+        w_ks = Linear(d_model, n_head * d_model)
+        w_vs = Linear(d_model, n_head * d_model)
 
     def forward(self, x):
         return ttnn.scaled_dot_product_attention(x, x, x, is_causal=False)
-
-
 
 
 @tt_torch_compat
@@ -549,7 +547,7 @@ class CLIP(TTCompatModule):
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x = convert_from_ttnn(self.transformer(x))
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
