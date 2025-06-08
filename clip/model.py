@@ -122,7 +122,7 @@ def tt_torch_compat(cls):
             # Convert all keyword arguments
             converted_kwargs = {k: convert_to_ttnn(v) for k, v in kwargs.items()}
 
-            return convert_from_ttnn(original_forward(self, *converted_args, **converted_kwargs))
+            return original_forward(self, *converted_args, **converted_kwargs)
         cls.forward = new_forward
         return cls
     else:
@@ -281,6 +281,14 @@ class ModifiedResNet(TTCompatModule):
 
         return x
 
+class LayerNorm(nn.LayerNorm):
+    """Subclass torch's LayerNorm to handle fp16."""
+
+    def forward(self, x: torch.Tensor):
+        orig_type = x.dtype
+        ret = super().forward(x.type(torch.float32))
+        return ret.type(orig_type)
+
 #class LayerNorm(TTCompatModule):
 #    """Subclass torch's LayerNorm to handle fp16."""
 
@@ -305,14 +313,17 @@ class ModifiedResNet(TTCompatModule):
 #        ttnn.layer_norm(x, weight=self.ttnn_weights, bias=self.ttnn_biases, epsilon=1e-5)
 
 @tt_torch_compat
-class LayerNorm(LightweightModule):
+class TTLayerNorm(LightweightModule):
 
     def __init__(self, shape):
         shape = convert_shape(shape)
-        self.weight = ttnn.zeros(shape, device=device)
-        self.bias = ttnn.zeros(shape, device=device)
+        self.weight = ttnn.zeros(shape, dtype=ttnn.float32, device=device)
+        self.bias = ttnn.zeros(shape, dtype=ttnn.float32, device=device)
 
     def forward(self, x):
+        print(x)
+        print(self.weight)
+        print(self.bias)
         return ttnn.layer_norm(x, weight=self.weight, bias=self.bias, epsilon=1e-5)
 
 
@@ -363,9 +374,10 @@ class ResidualAttentionBlock(TTCompatModule):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
-        self.ln_1 = LayerNorm(d_model)
+        self.ln_1 = TTLayerNorm(d_model)
         self.mlp = MultilayerPerceptron(d_model)
-        self.ln_2 = LayerNorm(d_model)
+        self.ln_2 = TTLayerNorm(d_model)
+        self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
@@ -373,7 +385,7 @@ class ResidualAttentionBlock(TTCompatModule):
 
     def forward(self, x):
         x = convert_to_ttnn(x)
-        x = x + self.attention(convert_from_ttnn(self.ln_1(x)))
+        x = x + convert_to_ttnn(self.attention(convert_from_ttnn(self.ln_1(x))))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -383,13 +395,14 @@ class Transformer(TTCompatModule):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = [ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)]
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in
+                                        range(
+                layers)])
 
     def forward(self, x):
-        x = convert_from_ttnn(x)
-        for resblock in self.resblocks:
-            x = resblock(x)
-        return x
+        #for resblock in self.resblocks:
+        #    x = resblock(x)
+        return self.resblocks(x)
 
 @tt_torch_compat
 class VisionTransformer(TTCompatModule):
@@ -419,7 +432,7 @@ class VisionTransformer(TTCompatModule):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x = convert_from_ttnn(self.transformer(x))
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -474,7 +487,7 @@ class CLIP(TTCompatModule):
             width=transformer_width,
             layers=transformer_layers,
             heads=transformer_heads,
-            attn_mask=convert_to_ttnn(self.build_attention_mask())
+            attn_mask=self.build_attention_mask()
         )
 
         self.vocab_size = vocab_size
